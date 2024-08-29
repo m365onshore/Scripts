@@ -12,7 +12,7 @@
 ############################################################################
 
 #Requires -Version 4
-#Requires -Modules MSOnline, ExchangeOnlineManagement
+#Requires -Modules MgGraph, ExchangeOnlineManagement
 
 <#
 	.SYNOPSIS
@@ -31,6 +31,8 @@
 		Array of roles to exclude from the report.  Default is AAD role of "Directory Synchronization Accounts".
 	.PARAMETER Output
 		Path and filename of the report.  Default is O365RoleReport.html in the current directory.
+	.PARAMETER CsvOutput
+		Path and filename of the report.  Default is O365RoleReport.csv in the current directory.
 	.NOTES
         Version 2.3
 		August 24, 2023
@@ -43,6 +45,7 @@
 Param(
     [Int16]$PasswordAgeThreshold=90,
     [String]$Output = "O365RoleReport.html",
+    [String]$CsvOutput = "O365RoleReport.csv",
     [Array]$IgnoredRoles="Directory Synchronization Accounts",
 	[ValidateSet('AAD','SCC','EXO')]$SkipWorkload,
 	[string]$AdminUPN
@@ -51,20 +54,22 @@ Param(
 
 function Get-UserDetails ($id) {
 	try {
-		$user = Get-MsolUser -ObjectId $id -ErrorAction Stop
-		$signInName = $user.SignInName
+		$user = Get-MgUser -UserId $id -Select Id,UserPrincipalName,LastPasswordChangeDateTime,Authentication,DisplayName,OnPremisesImmutableId -ErrorAction Stop
+		$signInName = $user.UserPrincipalName
 	
 		# Determine password age
-		$passwordAge = ((Get-Date) - $user.LastPasswordChangeTimestamp).Days
+		$passwordAge = ((Get-Date) - $user.LastPasswordChangeDateTime).Days
 
 		# Determine default MFA method
-		$mfaDefault = ($user.StrongAuthenticationMethods | Where-Object {$_.IsDefault -eq $true})
-
+		$mfaDetail = Get-MgReportAuthenticationMethodUserRegistrationDetail -UserRegistrationDetailsId $id -ErrorAction SilentlyContinue
+		if ($?){$mfaDefault = $mfaDetail.MethodsRegistered -join ";"}else{$mfaDefault = $null}
+		
+		$mfaState = $mfaDetail.IsMfaRegistered
 		# MFA Phone Number
-		$mfaPhone = $user.StrongAuthenticationUserDetails.PhoneNumber
+		#$mfaPhone = $user.StrongAuthenticationUserDetails.PhoneNumber
 
 		# Determine if cloud user
-		if ($user.ImmutableID -eq $null) {
+		if ($user.OnPremisesImmutableId -eq $null) {
 			$type = "Cloud"
 		}
 		else {
@@ -73,7 +78,7 @@ function Get-UserDetails ($id) {
 	}
 	catch {
 		try {
-			$user = Get-MsolServicePrincipal -ObjectId $id -ErrorAction Stop
+			$user = Get-MgServicePrincipal -ServicePrincipalId $id -ErrorAction Stop
 			$signInName = $user.DisplayName
 		}
 		catch {
@@ -84,8 +89,8 @@ function Get-UserDetails ($id) {
 	return New-Object -TypeName PSObject -Property @{
         SignInName = $signInName
         PasswordAge = $passwordAge
-        MFADefault = $mfaDefault.MethodType
-        MFAPhone = $mfaPhone
+        MFADefault = $mfaDefault
+        #MFAPhone = $mfaPhone
         MFAState = $mfaState
         UserType = $type
     }
@@ -103,31 +108,26 @@ function Get-ExoRoleGroupMembers {
 		if ($gMember.RecipientType -eq 'Group') {
 			# Member is Exchange role group
 			if ($parentGroupName) {
-				Write-Verbose -Message "Nested role group of $parentGroupName in $roleName role group: $($gMember.Name)"
-			}
-			else {
-				Write-Verbose -Message "Role group in $roleName role group: $($gMember.Name)"
+				Write-Host "Nested role group of $parentGroupName in $roleName role group: $($gMember.Name)"
+			}else {
+				Write-Host "Role group in $roleName role group: $($gMember.Name)"
 			}
 			$members += Get-ExoRoleGroupMembers -roleGroup $gMember -roleName $roleName -parentGroup $gMember.Name
-		}
-		elseif ($rgm.RecipientType -eq 'MailUniversalSecurityGroup') {
+		}elseif ($gMember.RecipientType -eq 'MailUniversalSecurityGroup') {
 			# Member is Security DL
 			if ($parentGroupName) {
-				Write-Verbose -Message "Nested mail-enabled security group of $parentGroupName in $roleName role group: $($gMember.Name)"
-			}
-			else {
-				Write-Verbose -Message "Mail-enabled security group in $roleName role group: $($gMember.Name)"				
+				Write-Host "Nested mail-enabled security group of $parentGroupName in $roleName role group: $($gMember.Name)"
+			}else {
+				Write-Host "Mail-enabled security group in $roleName role group: $($gMember.Name)"				
 			}
 			$members += Get-ExoSecurityGroupMembers -group $gMember -roleName $roleName -parentGroupName $gMember.Name
-		}
-		else {
+		}else {
 			# Member is individual
 			if ($parentGroupName) {
-				Write-Verbose -Message "User in role group $parentGroupName assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
+				Write-Host "User in role group $parentGroupName assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
 				$pgName = $parentGroupName + "\"
-			}
-			else {
-				Write-Verbose -Message "User assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
+			}else {
+				Write-Host "User assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
 				$pgName = ""
 			}
 			$members += New-Object -TypeName PSObject -Property @{
@@ -145,27 +145,27 @@ function Get-ExoSecurityGroupMembers {
 		$roleName,
 		$parentGroupName
 	)
-	$sgm = Get-DistributionGroupMember -Identity $group.Identity
+	$sgm = Get-DistributionGroupMember -Identity $group.distinguishedname
 	$members = @()
 	foreach ($gMember in $sgm) {
 		if ($gMember.RecipientType -like "*Group") {
 			# Member is security group
 			if ($parentGroupName) {
-				Write-Verbose -Message "Nested security group of $parentGroupName in $roleName role group: $($gMember.Name)"
+				Write-Host "Nested security group of $parentGroupName in $roleName role group: $($gMember.Name)"
 			}
 			else {
-				Write-Verbose -Message "Security group in $roleName role group: $($gMember.Name)"
+				Write-Host "Security group in $roleName role group: $($gMember.Name)"
 			}
 			$members += Get-ExoSecurityGroupMembers -group $gMember -roleName $roleName -parentGroupName $gMember.Name
 		}
 		else {
 			# Member is individual
 			if ($parentGroupName) {
-				Write-Verbose -Message "User in security group $parentGroupName assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
+				Write-Host "User in security group $parentGroupName assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
 				$pgName = $parentGroupName + "\"
 			}
 			else {
-				Write-Verbose -Message "User assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
+				Write-Host "User assigned roles of $roleName role group: $($gMember.Name) ($($gMember.WindowsLiveId))"
 				$pgName = ""
 			}
 			$members += New-Object -TypeName PSObject -Property @{
@@ -187,17 +187,17 @@ if ($SkipWorkload -contains 'AAD' -and $SkipWorkload -contains 'SCC' -and $SkipW
 	exit
 }
 
-# Always connect to MSOL, if necessary, for password and MFA details. MSOL still required due to MFA details not available in AAD v2.
+<# Always connect to MSOL, if necessary, for password and MFA details. MSOL still required due to MFA details not available in AAD v2.
 if (-not(Get-MsolCompanyInformation -ErrorAction SilentlyContinue)) {
 	Write-Host 'Connecting to Azure AD...'
 	Connect-MsolService
 }
-
+#>
 # Connect to SCC if not skipped, if necessary
 # Prefix is used to support connecting to SCC and EXO at the same time
 if ($SkipWorkload -notcontains 'SCC') {
 	if (-not(Get-Command -Name Get-SCCRoleGroup -ErrorAction SilentlyContinue)) {
-			Write-Host 'Connecting to Security & Compliance Center...'
+			Write-Host -ForegroundColor Yellow 'Connecting to Security & Compliance Center...'
 			Connect-IPPSSession -Prefix SCC -UserPrincipalName $AdminUPN
 	}
 }
@@ -205,7 +205,7 @@ if ($SkipWorkload -notcontains 'SCC') {
 # Connect to EXO if not skipped, if necessary
 if ($SkipWorkload -notcontains 'EXO') {
 	if (-not(Get-Command -Name Get-OrganizationConfig -ErrorAction SilentlyContinue)) {
-		Write-Host 'Connecting to Exchange Online...'
+		Write-Host -ForegroundColor Yellow 'Connecting to Exchange Online...'
 		Connect-ExchangeOnline -UserPrincipalName $AdminUPN -ShowBanner:$false
 	}
 }
@@ -214,31 +214,33 @@ $pUsers = @()
 
 #Process AAD roles
 if ($SkipWorkload -notcontains 'AAD') {
-	Write-Host 'Getting users with an Azure AD role assignment...'
+	Write-Host -ForegroundColor Magenta 'Getting users with an Azure AD role assignment...'
 	
-	$mRoles = Get-MsolRole
-
+	#$mRoles = Get-MsolRole
+	$mRoles = Get-MgDirectoryRole
 	foreach ($mRole in $mRoles) {
-		Write-Verbose -Message "Processing role $($mRole.Name)"
+		Write-Host -ForegroundColor Green "Processing role $($mRole.DisplayName)"
 		$mRoleUsers = @()
 
 		# Get the members, excluding service principals
-	    $mRoleUsers = Get-MsolRoleMember -RoleObjectId $mRole.ObjectId | Where-Object {$_.RoleMemberType -ne 'ServicePrincipal'}
+	    #$mRoleUsers = Get-MsolRoleMember -RoleObjectId $mRole.ObjectId | Where-Object {$_.RoleMemberType -ne 'ServicePrincipal'}
+	    $mRoleUsers = Get-MgDirectoryRoleMemberAsUser -DirectoryRoleId $mRole.Id | Where-Object {$_.RoleMemberType -ne 'ServicePrincipal'}
 
 	    # Iterate each user
 	    foreach ($mRoleUser in $mRoleUsers) {
-			Write-Verbose -Message "User assigned $($mRole.Name) role: $($mRoleUser.EmailAddress)"
+			#Write-Host "User assigned $($mRole.Name) role: $($mRoleUser.EmailAddress)"
+			Write-Host "User assigned $($mRole.DisplayName) role: $($mRoleUser.UserPrincipalName)"
 			
 		    # Get underlying MSOL user details
-	        $mUser = Get-UserDetails -id $mRoleUser.ObjectId
+	        $mUser = Get-UserDetails -id $mRoleUser.Id
 
 	        # Add to final object
 	        $pUsers += New-Object -TypeName PSObject -Property @{
 	            SignInName = $mUser.SignInName
 	            PasswordAge = $mUser.PasswordAge
-	            Role = $mRole.Name
+	            Role = $mRole.DisplayName
 	            MFADefault = $mUser.MFADefault
-	            MFAPhone = $mUser.MFAPhone
+	            MFAState = $mUser.mfaState
 	            UserType = $mUser.UserType
 				Workload = 'Azure AD'
 	        }
@@ -248,12 +250,12 @@ if ($SkipWorkload -notcontains 'AAD') {
 
 # Process SCC roles
 if ($SkipWorkload -notcontains 'SCC') {
-	Write-Host 'Getting users with a Security & Compliance Center role assignment...'
+	Write-Host -ForegroundColor Magenta 'Getting users with a Security & Compliance Center role assignment...'
 	
 	$sccRoles = Get-SCCRoleGroup
 	
 	foreach ($sccRole in $sccRoles) {
-		Write-Verbose "Processing role $($sccRole.Name)"
+		Write-Host -ForegroundColor Green "Processing role $($sccRole.Name)"
 		$roleUsers = @()
 		
 		# Get the members
@@ -263,24 +265,25 @@ if ($SkipWorkload -notcontains 'SCC') {
 	   	foreach ($sMember in $sgm) {
 			
 	        if ($sMember.RecipientType -like  '*group') {
-				Write-Verbose -Message "Group assigned $($sccRole.Name) role: $($sMember.DisplayName)"
-				$mgm = Get-MsolGroupMember -GroupObjectId $sMember.Guid.Guid
+				Write-Host "Group assigned $($sccRole.Name) role: $($sMember.DisplayName)"
+				#$mgm = Get-MsolGroupMember -GroupObjectId $sMember.Guid.Guid
+				$mgm = Get-MgGroupMember -GroupId $sMember.Guid.Guid
 				foreach ($mMember in $mgm) {
-					Write-Verbose -Message "User in $($sMember.DisplayName) group assigned $($sccRole.Name) role: $($mMember.DisplayName) ($($mMember.EmailAddress))"
+					Write-Host "User in $($sMember.DisplayName) group assigned $($sccRole.Name) role: $($mMember.DisplayName) ($($mMember.EmailAddress)) $($mMember.id)"
 					$roleUsers += New-Object -TypeName PSObject -Property @{
-						Id = $mMember.ObjectId.Guid
+						Id = $mMember.id
 						ParentGroup = $sMember.Displayname + "\"
 					}
 				}
 			}
 			else {
-				if ($sMember.PrimarySMTPAddress) {
-					$memberID = $sMember.PrimarySMTPAddress
+				if ($sMember.Alias) {
+					$memberID = $sMember.Alias
 				}
 				else {
 					$memberID = "No email address"
 				}
-				Write-Verbose -Message "User assigned $($sccRole.Name) role: $($sMember.Name) ($memberID)"
+				Write-Host "User assigned $($sccRole.Name) role: $($sMember.Name) ($memberID)"
 				$roleUsers += New-Object -TypeName PSObject -Property @{
 					Id = $sMember.Guid.Guid
 					ParentGroup = ""
@@ -300,7 +303,7 @@ if ($SkipWorkload -notcontains 'SCC') {
 	            PasswordAge = $mUser.PasswordAge
 	            Role = $sccRole.Name
 	            MFADefault = $mUser.MFADefault
-	            MFAPhone = $mUser.MFAPhone
+	            MFAState = $mUser.mfaState
 	            UserType = $mUser.UserType
 				Workload = 'Security and Compliance'
 	        }
@@ -309,7 +312,7 @@ if ($SkipWorkload -notcontains 'SCC') {
 }
 
 if ($SkipWorkload -notcontains 'EXO') {
-	Write-Host 'Getting users with an Exchange Online role assignment...'
+	Write-Host -ForegroundColor Magenta 'Getting users with an Exchange Online role assignment...'
 	#$exoRoleGroups = Get-RoleGroup | Where-Object {$_.Description -notlike "Membership in this role group is synchronized*" -or $null -eq $_.WellKnownObject}
 	$exoRoleGroups = Get-RoleGroup | Select-Object  -Property Name,Identity,@{n="AssigneeType";e={"RoleGroup"}},@{n="User";e={""}}
 	$directAssignments = Get-ManagementRoleAssignment | Where-Object {$_.RoleAssigneeType -eq 'User' -or $_.RoleAssigneeType -eq 'SecurityGroup'} | Select-Object -Property Name,Identity,@{n="AssigneeType";e={$_.RoleAssigneeType}},User
@@ -321,18 +324,16 @@ if ($SkipWorkload -notcontains 'EXO') {
 		# Get the members
 	    if ($rm.AssigneeType -eq 'RoleGroup') {
 			# Type is Exchange role group
-			Write-Verbose -Message "Processing role group $($rm.Name)"
+			Write-Host -ForegroundColor Green "Processing role group $($rm.Name)"
 			$roleUsers += Get-ExoRoleGroupMembers -roleGroup $rm -roleName $rm.Name
-			}
-		elseif ($rm.AssigneeType -eq 'SecurityGroup') {
+		}elseif ($rm.AssigneeType -eq 'SecurityGroup') {
 			# Type is Exchange mail-enabled security group
-			Write-Verbose -Message "Processing role group $($rm.Name)"
+			Write-Host -ForegroundColor Green "Processing role group $($rm.Name)"
 			$roleUsers += Get-ExoSecurityGroupMembers -group (Get-DistributionGroup -Identity $rm.User) -roleName $rm.Name
-		}
-		else {
+		}else {
 			# Type is user
-			Write-Verbose -Message "Processing role $($rm.Name)"
-			Write-Verbose -Message "User directly assigned $($rm.Name) role: $($rm.User)"
+			Write-Host -ForegroundColor Green "Processing role $($rm.Name)"
+			Write-Host "User directly assigned $($rm.Name) role: $($rm.User)"
 			$roleUsers += New-Object -TypeName PSObject -Property @{
 				Id = @((Get-User -Identity $rm.User).ExternalDirectoryObjectId)[0]
 				ParentGroup = ""
@@ -351,7 +352,7 @@ if ($SkipWorkload -notcontains 'EXO') {
 	            PasswordAge = $mUser.PasswordAge
 	            Role = $rm.Name
 	            MFADefault = $mUser.MFADefault
-	            MFAPhone = $mUser.MFAPhone
+	            MFAState = $mUser.mfaState
 	            UserType = $mUser.UserType
 				Workload = 'Exchange Online'
 	        }
@@ -360,6 +361,8 @@ if ($SkipWorkload -notcontains 'EXO') {
 }
 
 if ($pUsers.Count -gt 0) {
+	# Export csv
+	$pUsers | Select Workload, Role, SignInName, PasswordAge, UserType, MFAState, MFADefault |Export-csv -NoTypeInformation $CsvOutput
 	# Write the report
 
 	$Report = "<html><head><link rel='stylesheet' href='https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0-beta.3/css/bootstrap.min.css' integrity='sha384-Zug+QiDoJOrZ5t4lssLdxGhVrurbmBWopoEl+M6BdEfwnCJZtKxi1KgxUyJq13dy' crossorigin='anonymous'></head><body>"
@@ -393,7 +396,7 @@ if ($pUsers.Count -gt 0) {
 	        <th>Type</th>
 	        <th>Password Age</th>
 	        <th>MFA Default</th>
-	        <th>MFA Phone</th>
+	        <th>MFA State</th>
 	      </tr>
 	    </thead>
 	    <tbody>"
@@ -409,7 +412,8 @@ if ($pUsers.Count -gt 0) {
 	        If($u.MFADefault -eq $null) { $Class = "table-danger" } else { $Class = "table-success" }
 	        $Report += "<td class='$Class'>$($u.MFADefault)</td>"
 
-	        $Report += "<td>$($u.MFAPhone)</td>"
+	        If($u.mfaState -ne $true) { $Class = "table-danger" } else { $Class = "table-success" }
+	        $Report += "<td class='$Class'>$($u.mfaState)</td>"
 	        $Report += "</tr>"
 
 	    }
